@@ -8,7 +8,7 @@ fi
 
 # Create the user
 USERNAME="skywalker"
-PASSWORD="skywalker"  # You can change this to a more secure password or prompt for one
+PASSWORD="skywalker"
 
 # Check if the user already exists
 if id "$USERNAME" &>/dev/null; then
