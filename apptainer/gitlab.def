@@ -1,0 +1,96 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Author Alexander La Barge
+    Version v0.0.1
+
+%environment
+    export GITLAB_HOME=/srv/gitlab
+    export GITLAB_HOSTNAME=gitlab.unboundos.org
+    export SSH_PORT=2424
+    export HTTP_PORT=8929
+    export GITLAB_OMNIBUS_CONFIG="external_url 'https://$GITLAB_HOSTNAME:$HTTP_PORT'; gitlab_rails['gitlab_shell_ssh_port'] = $SSH_PORT; gitlab_rails['initial_root_password'] = 'MySuperSecretAndSecurePassw0rd!'; gitlab_rails['lfs_enabled'] = true"
+
+%post
+    apt-get update && apt-get upgrade -y
+    apt-get install -y curl openssh-server ca-certificates tzdata perl
+
+    # Add GitLab package repository
+    curl -sS https://packages.gitlab.com/install/repositories/gitlab/gitlab-ee/script.deb.sh | bash
+
+    # Install GitLab EE
+    EXTERNAL_URL="http://$GITLAB_HOSTNAME" apt-get install -y gitlab-ee
+
+    # Install cloudflared
+    mkdir -p --mode=0755 /usr/share/keyrings
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflared.list
+    apt-get update && apt-get install -y cloudflared
+
+%runscript
+    echo "Starting GitLab inside Apptainer"
+    exec /bin/bash
+
+%startscript
+    # Set up GitLab configurations
+    echo "$GITLAB_OMNIBUS_CONFIG" > /etc/gitlab/gitlab.rb
+    gitlab-ctl reconfigure
+
+    # Authenticate cloudflared
+    cloudflared tunnel login
+
+    # Delete existing tunnels if they exist
+    existing_tunnel_ids=$(cloudflared tunnel list | grep -E 'gitlab-http-tunnel|gitlab-ssh-tunnel' | awk '{print $1}')
+    for tunnel_id in $existing_tunnel_ids; do
+        cloudflared tunnel delete $tunnel_id
+    done
+
+    # Create tunnels and store their IDs
+    GITLAB_HTTP_TUNNEL_ID=$(cloudflared tunnel create gitlab-http-tunnel | grep "Created tunnel" | awk '{print $NF}')
+    GITLAB_SSH_TUNNEL_ID=$(cloudflared tunnel create gitlab-ssh-tunnel | grep "Created tunnel" | awk '{print $NF}')
+
+    # Create YAML configuration files for tunnels
+    cat > /root/.cloudflared/gitlab-http-tunnel.yml <<EOF
+tunnel: $GITLAB_HTTP_TUNNEL_ID
+credentials-file: /root/.cloudflared/$GITLAB_HTTP_TUNNEL_ID.json
+ingress:
+  - hostname: $GITLAB_HOSTNAME
+    service: http://localhost:$HTTP_PORT
+  - service: http_status:404
+EOF
+
+    cat > /root/.cloudflared/gitlab-ssh-tunnel.yml <<EOF
+tunnel: $GITLAB_SSH_TUNNEL_ID
+credentials-file: /root/.cloudflared/$GITLAB_SSH_TUNNEL_ID.json
+ingress:
+  - hostname: gitlab-ssh.unboundos.org
+    service: ssh://localhost:$SSH_PORT
+  - service: http_status:404
+EOF
+
+    # Set permissions for the configuration files
+    chmod 644 /root/.cloudflared/*.yml
+    chmod 600 /root/.cloudflared/*.json
+
+    # Map DNS routes
+    cloudflared tunnel route dns gitlab-http-tunnel $GITLAB_HOSTNAME
+    cloudflared tunnel route dns gitlab-ssh-tunnel gitlab-ssh.unboundos.org
+
+    # Start the Cloudflare tunnel services
+    cloudflared tunnel --config /root/.cloudflared/gitlab-http-tunnel.yml run $GITLAB_HTTP_TUNNEL_ID &
+    cloudflared tunnel --config /root/.cloudflared/gitlab-ssh-tunnel.yml run $GITLAB_SSH_TUNNEL_ID &
+
+    # Start GitLab services
+    gitlab-ctl start
+
+    # Wait for GitLab to be fully up and running
+    echo "Waiting for GitLab to be fully up and running..."
+    until gitlab-ctl status 2>&1 | grep "The GitLab Unicorn web server with pid" > /dev/null; do
+        sleep 10
+        echo -n "."
+    done
+    echo "GitLab is up and running."
+
+    # Verify configuration
+    gitlab-ctl status
